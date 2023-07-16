@@ -1,0 +1,8 @@
+[
+    {
+        "name": "Teamspeak Server Downloads",
+        "url": "https://teamspeak.com/en/downloads",
+        "css_selector": "#server > .platform.mb-5.linux"
+    }
+]
+

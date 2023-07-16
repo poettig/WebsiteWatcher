@@ -1,0 +1,6 @@
+*.log
+.idea
+*.iml
+venv
+__pycache__
+urls.json
