@@ -27,7 +27,7 @@ notifier = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(notifier)
 
 CONFIG_REQUIRED_PAGE_KEYS = ["name", "url", "css_selector"]
-CONFIG_OPTIONAL_PAGE_KEYS = ["receiver", "page_load_wait_time", "remove_regexes"]
+CONFIG_OPTIONAL_PAGE_KEYS = ["recipient", "page_load_wait_time", "remove_regexes"]
 
 print_progress: bool = True
 driver: typing.Optional[selenium.webdriver.remote.webdriver.WebDriver] = None
@@ -325,7 +325,7 @@ if __name__ == "__main__":
 		"--default-recipient", "-r",
 		default=None,
 		help=(
-			"The default notification receiver that gets errors regarding the URL file. "
+			"The default notification recipient that gets errors regarding the URL file. "
 			"Defaults to None (no notifications sent)."
 		)
 	)
