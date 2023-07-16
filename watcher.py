@@ -57,6 +57,7 @@ def get_relevant_content(url: str, css_selector: str, wait_time: int, geckodrive
 		firefox_service = service.Service(executable_path=geckodriver_path, log_path=os.devnull)
 		driver = webdriver.Firefox(service=firefox_service, options=options)
 
+	logging.info(f"  Fetching page...")
 	driver.get(url)
 
 	# Wait a bit for selenium to finish
