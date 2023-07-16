@@ -372,7 +372,7 @@ if __name__ == "__main__":
 		pages_config = parse_pages_config(args.pages)
 	except ValueError as err:
 		msg = f"Error in config file: {err}"
-		send_notification(args.default_receiver, msg)
+		send_notification(args.default_recipient, msg)
 		logging.error(msg)
 		close_driver()
 		exit(1)
