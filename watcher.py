@@ -11,13 +11,12 @@ import time
 import typing
 import logging
 import hashlib
+import bs4
 
 from enum import Enum
-from bs4 import BeautifulSoup
 
 import selenium.webdriver.remote.webdriver
 from selenium import webdriver
-from selenium.webdriver.common.by import By
 from selenium.webdriver.firefox import service
 from selenium.webdriver.firefox.options import Options
 from selenium.common.exceptions import NoSuchElementException
@@ -26,8 +25,8 @@ spec = importlib.util.spec_from_file_location("notifier.py", "/usr/local/bin/not
 notifier = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(notifier)
 
-CONFIG_REQUIRED_PAGE_KEYS = ["name", "url", "css_selector"]
-CONFIG_OPTIONAL_PAGE_KEYS = ["recipient", "page_load_wait_time", "remove_regexes"]
+CONFIG_REQUIRED_PAGE_KEYS = ["name", "url"]
+CONFIG_OPTIONAL_PAGE_KEYS = ["css_selector", "recipient", "page_load_wait_time", "remove_css_selectors"]
 
 print_progress: bool = True
 driver: typing.Optional[selenium.webdriver.remote.webdriver.WebDriver] = None
@@ -47,7 +46,7 @@ def send_notification(recipient: str, message: str):
 	notifier.send_notification("Website Watcher", message, recipient)
 
 
-def get_relevant_content(url: str, css_selector: str, wait_time: int, geckodriver_path: str):
+def get_rendered_dom(url: str, wait_time: int, geckodriver_path: str):
 	global driver
 
 	if driver is None:
@@ -64,13 +63,8 @@ def get_relevant_content(url: str, css_selector: str, wait_time: int, geckodrive
 	logging.info(f"  Waiting {wait_time}s for page to load...")
 	time.sleep(wait_time)
 
-	# Find relevant content by given css selector
-	elem = driver.find_element(By.CSS_SELECTOR, css_selector)
-
-	# Remove all carriage returns as this will cause problems with caching
-	source = elem.get_attribute("innerHTML").replace("\r", "")
-
-	return source
+	# Get full DOM and remove all carriage returns as this will cause problems with caching
+	return driver.execute_script("return document.documentElement.outerHTML").replace("\r", "")
 
 
 def get_file_name_for_url(url: str):
@@ -114,21 +108,47 @@ def check_if_url_changed(
 
 	nickname = page["name"]
 	url = page["url"]
-	css_selector = page["css_selector"]
-	remove_regexes = page.get("remove_regexes", [])
+	css_selector = page.get("css_selector", "html")
+	remove_css_selectors = page.get("remove_css_selectors", [])
 
 	logging.info(f"Checking '{nickname}' for changes...")
+	logging.info(f"  Loading DOM...")
 
-	# Fetch relevant segement from current state
-	new_segment = get_relevant_content(url, css_selector, wait_time, geckodriver_path)
+	# Get full rendered DOM
+	rendered_dom = get_rendered_dom(url, wait_time, geckodriver_path)
 
-	# Remove everything that matches one of the regexes
-	for regex in remove_regexes:
-		new_segment = re.sub(regex, "", new_segment)
+	# Load it into the BeautifulSoup parser
+	dom_parser = bs4.BeautifulSoup(rendered_dom, "html.parser")
 
-	# Prettify it for comparison
-	new_content_parser = BeautifulSoup(new_segment, "html.parser")
-	new_segment = new_content_parser.prettify().split("\n")
+	# Extract the relevant parts by css selector
+	relevant_parts = dom_parser.select(css_selector)
+
+	logging.info(f"  Constructing content to compare...")
+
+	content_to_compare = []
+	part: bs4.Tag
+	for idx, part in enumerate(relevant_parts):
+		# The part might have been decomposed because of the remove selectors, skip if that happened
+		if part.decomposed:
+			continue
+
+		# Remove everything that matches a filter_css_selector
+		for selector in remove_css_selectors:
+			# Use parent as the selector as the selector might match the current parts tag itself
+			if part.parent:
+				part_to_search_in = part.parent
+			else:
+				part_to_search_in = part
+
+			for to_decompose in part_to_search_in.select(selector):
+				to_decompose.decompose()
+
+		# Prettify it for comparison, filter out empty lines
+		content_to_compare.extend(filter(lambda x: x, part.prettify().split("\n")))
+
+		# Add separator if not the last element
+		if idx != len(relevant_parts) - 1:
+			content_to_compare.append("##### SEGEMENT SEPARATOR #####")
 
 	logging.info(f"  Reading cache...")
 
@@ -137,7 +157,7 @@ def check_if_url_changed(
 
 	# Nothing to compare against, report that a new URL was initialized
 	if not cached_segment:
-		write_cache(url, css_selector, new_segment, cache_dir)
+		write_cache(url, css_selector, content_to_compare, cache_dir)
 		logging.info(f"New page initialized.")
 		return DiffResult.INITIALIZED, get_file_name_for_url(url)
 
@@ -148,26 +168,20 @@ def check_if_url_changed(
 		return DiffResult.SELECTOR_CHANGED, ""
 
 	# Write the new segment to the cache
-	write_cache(url, css_selector, new_segment, cache_dir)
+	write_cache(url, css_selector, content_to_compare, cache_dir)
 
 	# Diff it
 	logging.info(f"  Diffing...")
 	diff_file_path = get_file_path_for_url(url, diff_dir) + f"_diff_{int(time.time() * 1000)}.html"
-	if cached_segment != new_segment:
+	if cached_segment != content_to_compare:
 		# Create the diff result
 		with open(diff_file_path, "w") as diff_file_handle:
-			html = difflib.HtmlDiff(tabsize=4, wrapcolumn=80).make_file(cached_segment, new_segment)
-			soup = BeautifulSoup(html, "html.parser")
+			html = difflib.HtmlDiff(tabsize=4, wrapcolumn=80).make_file(cached_segment, content_to_compare)
+			soup = bs4.BeautifulSoup(html, "html.parser")
 			header = soup.new_tag("h3")
 			header.string = f"[{nickname}] Change detected at {datetime.datetime.now()}"
 			soup.body.insert(0, header)
 			diff_file_handle.write(soup.prettify())
-
-		# Save the old and new diff for potential debugging of false positives
-		with open(re.sub(".html$", "_old.html", diff_file_path), "w") as diff_file_handle_old:
-			diff_file_handle_old.write(f"{cached_segment}")
-		with open(re.sub(".html$", "_new.html", diff_file_path), "w") as diff_file_handle_new:
-			diff_file_handle_new.write(f"{new_segment}")
 
 		# Return the diff file name
 		logging.info(f"Page changed.")
@@ -185,12 +199,12 @@ def clear_old_files(base_dir: str, max_age_in_seconds: int):
 
 
 def parse_pages_config(pages_config_path: str):
-	def check_key_exists(data: dict, key: str, page_idx: int = -1):
-		if key not in data:
-			message = f"Missing key '{key}'"
+	def check_key_exists(data: dict, config_key: str, page_idx: int = -1):
+		if config_key not in data:
+			message = f"Missing key `{config_key}`"
 
 			if page_idx >= 0:
-				message += f" in page {page_idx + 1}."
+				message += f" in page {page_idx} ({data.get('name')})."
 			else:
 				message += " at the top level."
 
@@ -223,17 +237,11 @@ def parse_pages_config(pages_config_path: str):
 
 		for idx, page in enumerate(pages_conf):
 			# Check if all required page keys exist
-			map(lambda key: check_key_exists(page, key, idx), CONFIG_REQUIRED_PAGE_KEYS)
+			for key in CONFIG_REQUIRED_PAGE_KEYS:
+				check_key_exists(page, key, idx)
 
 			# Check if there are unknown page keys
 			check_unknown_keys(page, CONFIG_REQUIRED_PAGE_KEYS + CONFIG_OPTIONAL_PAGE_KEYS, idx)
-
-			# Check if the regexes are valid
-			for regex_idx, regex in enumerate(page.get("remove_regexes", [])):
-				try:
-					re.compile(regex)
-				except (re.error, TypeError):
-					raise ValueError(f"Page {idx + 1}, regex {regex_idx + 1} is not a valid regex.")
 
 		return pages_conf
 
@@ -241,9 +249,10 @@ def parse_pages_config(pages_config_path: str):
 def check_change(
 	pages: typing.List[typing.Dict],
 	cache_dir: str,
+	cache_url: str,
 	diff_dir: str,
+	diff_url: str,
 	geckodriver_path: str,
-	diff_url: str = None,
 	default_recipient: str = None,
 	default_page_load_wait_time: int = 5
 ):
@@ -252,7 +261,7 @@ def check_change(
 		nickname = page["name"]
 		url = page["url"]
 		recipient = page.get("recipient", default_recipient)
-		css_selector = page["css_selector"]
+		css_selector = page.get("css_selector", "html")
 		wait_time = page.get("page_load_wait_time", default_page_load_wait_time)
 
 		# Maybe has to run twice if the selector changed
@@ -272,11 +281,11 @@ def check_change(
 
 			if result == DiffResult.INITIALIZED:
 				message = f"Initialized new URL to watch: [{nickname}]({url})."
-				message += f"\nUsed CSS selector: '{css_selector}'."
+				message += f"\nUsed CSS selector: `{css_selector}`."
 
-				if diff_url is not None:
+				if cache_url is not None:
 					message += f"\nThe segment that will be scanned for can be checked"
-					message += f" for correctness [here]({diff_url}{file_name})."
+					message += f" for correctness [here]({cache_url}{file_name})."
 					message += f"\nFirst line is the css selector and not part of the segment."
 
 				send_notification(recipient, message)
@@ -310,16 +319,22 @@ if __name__ == "__main__":
 		help="The directory to store comparison cache files in."
 	)
 	parser.add_argument(
+		"--cache-url", "-cu",
+		help=(
+			"The URL were the cache results are accessible (if you want that)."
+			" For this to work, --cache-dir needs to be served by a webserver."
+		)
+	)
+	parser.add_argument(
 		"--diff-dir", "-dd",
 		required=True,
 		help="The directory to store diff results in."
 	)
 	parser.add_argument(
 		"--diff-url", "-du",
-		required=True,
 		help=(
 			"The URL were the diff results are accessible (if you want that)."
-			" For this to work, --cache-dir needs to be served by a webserver."
+			" For this to work, --diff-dir needs to be served by a webserver."
 		)
 	)
 	parser.add_argument(
@@ -382,9 +397,10 @@ if __name__ == "__main__":
 	check_change(
 		pages_config,
 		args.cache_dir,
+		args.cache_url,
 		args.diff_dir,
-		args.geckodriver_path,
 		args.diff_url,
+		args.geckodriver_path,
 		args.default_recipient,
 		args.default_page_load_wait_time
 	)
